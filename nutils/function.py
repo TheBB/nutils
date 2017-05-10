@@ -30,8 +30,10 @@ possible only via inverting of the geometry function, which is a fundamentally
 expensive and currently unsupported operation.
 """
 
-from . import util, numpy, numeric, log, core, cache, transform, _
-import sys, warnings, itertools, functools, operator, inspect, numbers
+from . import util, numpy, numeric, log, core, cache, compile, transform, _
+import sys, warnings, itertools, functools, operator, inspect, numbers, ctypes
+from llvmlite import ir
+import llvmlite.binding as llvm
 
 CACHE = 'Cache'
 TRANS = 'Trans'
@@ -39,6 +41,7 @@ OPPTRANS = 'OppTrans'
 POINTS = 'Points'
 
 TOKENS = CACHE, TRANS, OPPTRANS, POINTS
+COMPILABLE_TOKENS = (POINTS,)
 
 class Evaluable( cache.Immutable ):
   'Base class'
@@ -52,9 +55,27 @@ class Evaluable( cache.Immutable ):
   def evalf( self, *args ):
     raise NotImplementedError( 'Evaluable derivatives should implement the evalf method' )
 
+  def compilef( self, engine, module, stdlib ):
+    raise NotImplementedError( 'Compilable subclasses should implement the compilef method' )
+
+  def reconstruct( self, addr ):
+    raise NotImplementedError( 'Compilable subclasses should implement the reconstruct method' )
+
+  @property
+  def name( self ):
+    return 'nutils-' + hex(id(self))
+
   @property
   def isconstant( self ):
     return all( arg not in TOKENS and arg.isconstant for arg in self.__args )
+
+  @property
+  def iscompilable( self ):
+    return all( arg in COMPILABLE_TOKENS or arg.iscompilable for arg in self.__args ) and self.iscompilablef
+
+  @property
+  def iscompilablef( self ):
+    return False
 
   @cache.property
   def serialized( self ):
@@ -112,6 +133,42 @@ class Evaluable( cache.Immutable ):
   def __str__( self ):
     return self.__class__.__name__
 
+  def compile( self ):
+    assert self.iscompilable
+
+    engine, module, stdlib = compile.environment(self.name)
+    ptr = stdlib['ptr']
+
+    ops, inds = self.serialized
+    ops = ops + (self,)
+    compiled = [op.compilef(engine, module, stdlib) for i, op in enumerate(ops)]
+
+    ntoks = len(TOKENS)
+    func = ir.Function(module, ir.FunctionType(ptr, (ptr,)*ntoks), name=self.name + '-master')
+    blk = func.append_basic_block(name='entry')
+    bld = ir.IRBuilder(blk)
+    stack = list(func.args)
+
+    for fn, ind in zip(compiled, inds):
+      stack.append(bld.call(fn, [stack[j] for j in ind]))
+
+    bld.ret(bld.bitcast(stack[-1], ptr))
+
+    print(str(module))
+
+    refmod = llvm.parse_assembly(str(module))
+    refmod.verify()
+    engine.add_module(refmod)
+    engine.finalize_object()
+    self.__engine = engine
+
+  def eval_compiled( self, engine, fcache, trans, opptrans, points ):
+    print('compiled evaluation')
+    args = (ctypes.c_void_p,) * 5
+    func = ctypes.CFUNCTYPE(*args)(engine.get_function_address(self.name + '-master'))
+    ret = func(None, None, None, None)
+    return self.reconstruct(ret)
+
   def eval( self, elem=None, ischeme=None, fcache=cache.WrapperDummyCache() ):
     'evaluate'
     
@@ -153,6 +210,15 @@ class Evaluable( cache.Immutable ):
     ops, inds = self.serialized
     assert TOKENS == ( CACHE, TRANS, OPPTRANS, POINTS )
     values = [ fcache, trans, opptrans, points ]
+
+    engine = None
+    try:
+      engine = self.__engine
+    except AttributeError:
+      pass
+    if engine:
+      return self.eval_compiled(engine, *values)
+
     for op, indices in zip( list(ops)+[self], inds ):
       args = [ values[i] for i in indices ]
       try:
@@ -320,6 +386,10 @@ class Array( Evaluable ):
     assert dtype is float or dtype is int or dtype is bool, 'invalid dtype {!r}'.format(dtype)
     self.dtype = dtype
     Evaluable.__init__( self, args=args )
+
+  def compiled_retval( self ):
+    obj = numpy.empty(self.shape, dtype=ctypes.c_double)
+    return obj, ctypes.byref(_ArrayStruct(obj))
 
   # mathematical operators
 
@@ -596,6 +666,28 @@ class Constant( Array ):
 
   def evalf( self ):
     return self.value[_]
+
+  @property
+  def iscompilablef( self ):
+    return True
+
+  def compilef( self, engine, module, std ):
+    size_t = std['size_t']
+    func = ir.Function(module, ir.FunctionType(std['ndarray'].as_pointer(), ()), name=self.name)
+    bld = ir.IRBuilder(func.append_basic_block(name='entry'))
+
+    # Create a NDArrayRepr for the return value, with an additional singleton dimension
+    new_shape = (1,) + self.value.shape
+    self.struct = compile.NDArrayRepr(self.ndim+1)(self.value, shape=new_shape)
+
+    # Just return the address of the internal array representation
+    bld.ret(ir.Constant(size_t, ctypes.addressof(self.struct)).inttoptr(std['ndarray'].as_pointer()))
+
+    return func
+
+  def reconstruct( self, value ):
+    value = ctypes.cast(value, ctypes.POINTER(compile.NDArrayRepr(self.ndim+1)))
+    return value[0].array(self.dtype)
 
   @cache.property
   def _isunit( self ):
